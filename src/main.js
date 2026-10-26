@@ -1,4 +1,4 @@
-mport {configured,initAccount,readListings,createListing,session} from './backend';
+import {configured,initAccount,readListings,createListing,session} from './backend';
 import {mountAccount,requireAccount,authDialog} from './account';
 import './style.css';
 import {registerSW} from 'virtual:pwa-register';
