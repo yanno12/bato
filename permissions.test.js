@@ -1,0 +1,53 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {readFile} from 'node:fs/promises';
+import {PGlite} from '@electric-sql/pglite';
+
+test('PostgreSQL permissions enforce signup roles, memberships, moderation and privacy',async()=>{
+ const pg=new PGlite();
+ try{
+ await pg.exec(`create role anon; create role authenticated; create schema auth;
+ create table auth.users(id uuid primary key,email text,raw_user_meta_data jsonb);
+ create function auth.uid() returns uuid language sql stable as $$ select nullif(current_setting('request.jwt.claim.sub',true),'')::uuid $$;
+ grant usage on schema auth to anon,authenticated; grant execute on function auth.uid() to anon,authenticated;`);
+ await pg.exec(await readFile(new URL('../supabase/schema.sql',import.meta.url),'utf8'));
+ const sender='00000000-0000-4000-8000-000000000001',shipper='00000000-0000-4000-8000-000000000002',admin='00000000-0000-4000-8000-000000000003';
+ await pg.query(`insert into auth.users values ($1,'sender@example.com','{"display_name":"Sender","account_type":"admin","role":"admin"}'),($2,'shipper@example.com','{"display_name":"Shipper","account_type":"shipper"}'),($3,'admin@example.com','{"display_name":"Admin"}')`,[sender,shipper,admin]);
+ assert.equal((await pg.query('select role from public.profiles where id=$1',[sender])).rows[0].role,'sender','signup metadata cannot grant admin');
+ await pg.query("update public.profiles set role='admin' where id=$1",[admin]);
+ const as=async(role,id='')=>{await pg.exec('reset role');await pg.query("select set_config('request.jwt.claim.sub',$1,false)",[id]);await pg.exec('set role '+role)};
+ const denied=async(sql,params=[])=>assert.rejects(()=>pg.query(sql,params));
+ await as('authenticated',sender);
+ assert.equal((await pg.query('select count(*)::int n from public.profiles')).rows[0].n,1,'private profiles are isolated');
+ await denied("update public.profiles set role='admin' where id=$1",[sender]);
+ await denied("insert into public.memberships(user_id,active_until) values($1,now()+interval '1 month')",[sender]);
+ await denied('select public.admin_update_user($1,$2,false)',[shipper,'admin']);
+ const cargo={origin:'Atlanta',destination:'Dakar',description:'Boxes',date:'2027-01-20',volume:2,name:'Sender'};
+ const departure={origin:'Atlanta',destination:'Lomé',description:'Boxes',date:'2027-01-20',deadline:'2027-01-10',space:4,company:'Shipper',port:'Lomé'};
+ await denied("insert into public.listings(kind,payload) values('departure',$1)",[departure]);
+ await denied("insert into public.listings(owner_id,kind,payload) values($1,'cargo',$2)",[shipper,cargo]);
+ await denied("insert into public.listings(kind,status,payload) values('cargo','approved',$1)",[cargo]);
+ await denied("insert into public.listings(kind,payload) values('cargo',$1)",[{...cargo,email:'leak@example.com'}]);
+ await denied("insert into public.listings(kind,payload) values('cargo',$1)",[{...cargo,destination:'Bamako',port:'Abidjan'}]);
+ const row=(await pg.query("insert into public.listings(kind,payload) values('cargo',$1) returning id,status",[cargo])).rows[0];
+ assert.equal(row.status,'pending');
+ await denied("update public.listings set status='approved' where id=$1",[row.id]);
+ await as('anon');assert.equal((await pg.query('select count(*)::int n from public.listings')).rows[0].n,0,'pending hidden from public');
+ await denied('select * from public.profiles');
+ await as('authenticated',shipper);
+ await denied("insert into public.listings(kind,payload) values('departure',$1)",[departure]);
+ await as('authenticated',admin);
+ await denied('select public.admin_update_user($1,$2,false)',[admin,'sender']);
+ await pg.query('select public.admin_set_membership($1,now()+interval \'1 month\')',[shipper]);
+ await pg.query('select public.admin_moderate_listing($1,$2)',[row.id,'approved']);
+ await as('anon');assert.equal((await pg.query('select count(*)::int n from public.listings')).rows[0].n,1,'approved visible');
+ await as('authenticated',shipper);
+ await pg.query("insert into public.listings(kind,payload) values('departure',$1)",[departure]);
+ await as('authenticated',admin);await pg.query('select public.admin_set_membership($1,now()-interval \'1 day\')',[shipper]);
+ await as('authenticated',shipper);await denied("insert into public.listings(kind,payload) values('departure',$1)",[departure]);
+ await as('authenticated',admin);await pg.query('select public.admin_update_user($1,$2,true)',[sender,'sender']);
+ await as('authenticated',sender);await denied("insert into public.listings(kind,payload) values('cargo',$1)",[cargo]);
+ await as('anon');assert.equal((await pg.query('select count(*)::int n from public.listings')).rows[0].n,0,'suspended owner hidden');
+ await as('authenticated',admin);assert.ok((await pg.query('select count(*)::int n from public.admin_audit')).rows[0].n>=4);
+ }finally{await pg.close()}
+});
